@@ -11,6 +11,8 @@ from utils import format_time, format_int
 from estimator import estimate_crack_time, estimate_total_space
 from strength_checker import check_strength
 from graph import Graph, HAS_MPL
+from results_logger import log_result, LOG_FILE
+from results_viewer import ResultsViewer, open_file_externally
 
 if HAS_MPL:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -51,11 +53,12 @@ class App:
 
         self.tracker = Tracker()
         self.running = False
+        self.paused = False
         self.start_time = None
         self.total_space = 0
         self.event_queue = queue.Queue()
         self._last_graph_draw = 0.0
-        self._graph_redraw_interval = 1.0  # seconds — keep UI snappy
+        self._graph_redraw_interval = 5.0  # seconds — keep UI snappy on long runs
 
         # Char-set checkboxes
         self.var_lower = tk.BooleanVar(value=True)
@@ -220,6 +223,14 @@ class App:
         )
         self.btn_start.pack(fill="x", ipady=10, pady=(0, 8))
 
+        self.btn_pause = tk.Button(
+            wrap, text="⏸  PAUSE", command=self.toggle_pause,
+            bg=WARNING, fg="#0a1929", activebackground="#eab308",
+            activeforeground="#0a1929", font=FONT_BUTTON,
+            relief="flat", bd=0, cursor="hand2", state="disabled"
+        )
+        self.btn_pause.pack(fill="x", ipady=8, pady=(0, 8))
+
         row = tk.Frame(wrap, bg=BG_DARK)
         row.pack(fill="x")
         row.columnconfigure(0, weight=1)
@@ -248,14 +259,24 @@ class App:
         body = self._make_card(parent, "ATTACK PROGRESS", "\U0001F4CA")
 
         status_row = tk.Frame(body, bg=BG_PANEL)
-        status_row.pack(fill="x", pady=(0, 8))
-        tk.Label(status_row, text="Status:", bg=BG_PANEL, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
-        self.lbl_status = tk.Label(status_row, text="Idle", bg=BG_PANEL,
-                                   fg=TEXT_DIM, font=FONT_VALUE)
-        self.lbl_status.pack(side="left", padx=(6, 0))
-        self.lbl_percent = tk.Label(status_row, text="0%", bg=BG_PANEL,
-                                    fg=ACCENT, font=FONT_VALUE)
+        status_row.pack(fill="x", pady=(0, 10))
+
+        # A chip-like badge so the status really pops.
+        self._status_chip = tk.Frame(
+            status_row, bg=SLATE, highlightthickness=1,
+            highlightbackground=BORDER
+        )
+        self._status_chip.pack(side="left")
+        self.lbl_status = tk.Label(
+            self._status_chip, text="  IDLE  ", bg=SLATE, fg=TEXT_DIM,
+            font=("Segoe UI", 12, "bold"), padx=10, pady=4
+        )
+        self.lbl_status.pack()
+
+        self.lbl_percent = tk.Label(
+            status_row, text="0%", bg=BG_PANEL, fg=ACCENT,
+            font=("Consolas", 14, "bold")
+        )
         self.lbl_percent.pack(side="right")
 
         # Progress bar (custom, no ttk theming pain)
@@ -345,6 +366,37 @@ class App:
         self.lbl_r_time = self._make_result_row(details, "Time Taken:")
         self.lbl_r_speed = self._make_result_row(details, "Average Speed:")
 
+        # ---- Results history actions ----
+        actions = tk.Frame(body, bg=BG_PANEL)
+        actions.pack(fill="x", pady=(8, 4))
+
+        tk.Label(
+            actions,
+            text=f"All runs are saved to {LOG_FILE}",
+            bg=BG_PANEL, fg=TEXT_DIM, font=FONT_SUBTITLE
+        ).pack(anchor="w", padx=2, pady=(0, 6))
+
+        btn_row = tk.Frame(body, bg=BG_PANEL)
+        btn_row.pack(fill="x")
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        tk.Button(
+            btn_row, text="\U0001F4D1  VIEW HISTORY",
+            command=self._open_history,
+            bg=ACCENT, fg="white", activebackground=ACCENT_DARK,
+            activeforeground="white", font=FONT_BUTTON,
+            relief="flat", bd=0, cursor="hand2"
+        ).grid(row=0, column=0, sticky="ew", ipady=8, padx=(0, 4))
+
+        tk.Button(
+            btn_row, text="\U0001F4C2  OPEN CSV",
+            command=lambda: open_file_externally(LOG_FILE),
+            bg=SLATE, fg=TEXT, activebackground="#334155",
+            activeforeground=TEXT, font=FONT_BUTTON,
+            relief="flat", bd=0, cursor="hand2"
+        ).grid(row=0, column=1, sticky="ew", ipady=8, padx=(4, 0))
+
     def _make_result_row(self, parent, label):
         row = tk.Frame(parent, bg=BG_PANEL)
         row.pack(fill="x", pady=2)
@@ -429,9 +481,18 @@ class App:
         self.start_time = time.time()
         self._last_graph_draw = 0.0
         self.running = True
+        self.paused = False
+        self.btn_pause.config(text="⏸  PAUSE", state="normal")
         self.total_space = estimate_total_space(len(chars), min_len, max_len)
+        self._run_params = {
+            "charset_size": len(chars),
+            "min_length": min_len,
+            "max_length": max_len,
+        }
 
-        self.lbl_status.config(text="Running...", fg=ACCENT)
+        _, est_seconds = estimate_crack_time(chars, min_len, max_len)
+        self._eta_seconds = est_seconds
+        self._set_status("Running...", fg="white", bg=ACCENT_DARK)
         self._set_progress(0)
         self.stat_current.config(text="-")
         self.stat_attempts.config(text="0")
@@ -453,18 +514,33 @@ class App:
             target=brute_force_attack,
             args=(pwd, chars, self.tracker,
                   self._on_progress, self._on_result,
-                  lambda: self.running, min_len, max_len),
+                  lambda: self.running, min_len, max_len,
+                  lambda: self.paused),
             daemon=True
         )
         thread.start()
 
+    def toggle_pause(self):
+        if not self.running:
+            return
+        if self.paused:
+            self.paused = False
+            self.btn_pause.config(text="⏸  PAUSE")
+            self._set_status("Running...", fg="white", bg=ACCENT_DARK)
+        else:
+            self.paused = True
+            self.btn_pause.config(text="▶  RESUME")
+            self._set_status("Paused", fg="#0a1929", bg=WARNING)
+
     def reset(self):
         self.running = False
+        self.paused = False
+        self.btn_pause.config(text="⏸  PAUSE", state="disabled")
         time.sleep(0.05)
         self.tracker.reset()
         self.entry.delete(0, tk.END)
 
-        self.lbl_status.config(text="Idle", fg=TEXT_DIM)
+        self._set_status("Idle")
         self._set_progress(0)
         self.stat_current.config(text="-")
         self.stat_attempts.config(text="-")
@@ -536,21 +612,22 @@ class App:
 
     def _apply_result(self, password, attempts, elapsed):
         self.running = False
+        self.paused = False
+        self.btn_pause.config(text="⏸  PAUSE", state="disabled")
         speed = int(attempts / elapsed) if elapsed > 0 else 0
         self.stat_attempts.config(text=format_int(attempts))
         self.stat_time.config(text=format_time(elapsed))
         self.stat_speed.config(text=format_int(speed))
-        self._set_progress(100 if password not in ("Not Found",
-                                                   "Wordlist missing") else 0)
+        self._set_progress(100 if password != "Not Found" else 0)
 
-        if password in ("Not Found", "Wordlist missing"):
-            self.lbl_status.config(text=password, fg=DANGER)
+        if password == "Not Found":
+            self._set_status("Not Found", fg="white", bg=DANGER_DARK)
             self.lbl_result_icon.config(text="\u2717", fg=DANGER)
             self.lbl_result_title.config(text="PASSWORD NOT FOUND",
                                          fg=DANGER)
             self.lbl_r_password.config(text=password, fg=DANGER)
         else:
-            self.lbl_status.config(text="Cracked", fg=SUCCESS)
+            self._set_status("Cracked", fg="white", bg=SUCCESS_DARK)
             self.lbl_result_icon.config(text="\u2714", fg=SUCCESS)
             self.lbl_result_title.config(text="PASSWORD CRACKED!",
                                          fg=SUCCESS)
@@ -561,11 +638,55 @@ class App:
         self.lbl_r_speed.config(text=f"{format_int(speed)} attempts/second",
                                 fg=ACCENT)
 
+        params = getattr(self, "_run_params", None) or {
+            "charset_size": 0, "min_length": 0, "max_length": 0
+        }
+        status = "Cracked" if password != "Not Found" else "Not Found"
+        try:
+            log_result(
+                password=password,
+                attempts=attempts,
+                elapsed=elapsed,
+                charset_size=params["charset_size"],
+                min_length=params["min_length"],
+                max_length=params["max_length"],
+                status=status,
+            )
+            current = self.lbl_status.cget("text").strip()
+            self.lbl_status.config(
+                text=f"  {current} • LOGGED TO {LOG_FILE.upper()}  "
+            )
+        except Exception:
+            pass
+
         if self.graph:
             self.graph.plot(self.tracker)
             self.canvas.draw_idle()
 
+    def _set_status(self, text, fg=None, bg=None):
+        if fg is None:
+            fg = TEXT_DIM
+        if bg is None:
+            bg = SLATE
+        chip_text = f"  {text.upper()}  "
+        self.lbl_status.config(text=chip_text, fg=fg, bg=bg)
+        self._status_chip.config(bg=bg)
+
+    def _open_history(self):
+        win = ResultsViewer(self.root, file_path=LOG_FILE)
+        win.transient(self.root)
+        win.lift()
+        win.focus_force()
+
     def _set_progress(self, pct):
         pct = max(0.0, min(100.0, float(pct)))
         self.bar_fill.place(relwidth=pct / 100.0)
-        self.lbl_percent.config(text=f"{pct:.0f}%")
+        if pct == 0:
+            text = "0%"
+        elif pct >= 1:
+            text = f"{pct:.1f}%"
+        elif pct >= 0.001:
+            text = f"{pct:.3f}%"
+        else:
+            text = "<0.001%"
+        self.lbl_percent.config(text=text)

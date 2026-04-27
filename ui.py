@@ -452,56 +452,66 @@ class App:
     def start_attack(self):
         if self.running:
             return
+
         pwd = self.entry.get()
         if not pwd:
             messagebox.showerror("Error", "Please enter a password to test.")
             return
 
+        # Build charset
         chars = build_charset(
-            self.var_lower.get(), self.var_upper.get(),
-            self.var_digits.get(), self.var_special.get()
+            self.var_lower.get(),
+            self.var_upper.get(),
+            self.var_digits.get(),
+            self.var_special.get()
         )
+
         if not chars:
-            messagebox.showerror("Error",
-                                 "Select at least one character set.")
+            messagebox.showerror("Error", "Select at least one character set.")
             return
 
+        # Length settings
         min_len = max(1, self.var_min_length.get())
         max_len = max(min_len, self.var_max_length.get())
 
         if max_len < len(pwd):
             messagebox.showwarning(
                 "Range too small",
-                "Max length is shorter than the password — "
-                "it will not be found in this range."
+                "Max length is shorter than the password — it will not be found."
             )
 
-        # Reset stats
+        # 🔄 RESET STATE
         self.tracker.reset()
         self.start_time = time.time()
         self._last_graph_draw = 0.0
         self.running = True
         self.paused = False
+
         self.btn_pause.config(text="⏸  PAUSE", state="normal")
-        self.total_space = estimate_total_space(len(chars), min_len, max_len)
+
+        # Store run parameters (used in logger)
         self._run_params = {
             "charset_size": len(chars),
             "min_length": min_len,
             "max_length": max_len,
         }
 
+        # Estimate calculations
+        self.total_space = estimate_total_space(len(chars), min_len, max_len)
         _, est_seconds = estimate_crack_time(chars, min_len, max_len)
         self._eta_seconds = est_seconds
+
+        # 🟢 UI RESET
         self._set_status("Running...", fg="white", bg=ACCENT_DARK)
         self._set_progress(0)
+
         self.stat_current.config(text="-")
         self.stat_attempts.config(text="0")
         self.stat_time.config(text="00:00:00")
         self.stat_speed.config(text="0")
 
         self.lbl_result_icon.config(text="\u25CB", fg=TEXT_DIM)
-        self.lbl_result_title.config(text="Attack in progress...",
-                                     fg=TEXT_DIM)
+        self.lbl_result_title.config(text="Attack in progress...", fg=TEXT_DIM)
         self.lbl_r_password.config(text="-", fg=TEXT)
         self.lbl_r_attempts.config(text="-", fg=TEXT)
         self.lbl_r_time.config(text="-", fg=TEXT)
@@ -509,13 +519,20 @@ class App:
 
         self._refresh_estimate()
 
-        # Update guesses_per_second estimate from charset/length
+        # 🚀 START THREAD (NO LIMITS — manual stop only)
         thread = threading.Thread(
             target=brute_force_attack,
-            args=(pwd, chars, self.tracker,
-                  self._on_progress, self._on_result,
-                  lambda: self.running, min_len, max_len,
-                  lambda: self.paused),
+            args=(
+                pwd,
+                chars,
+                self.tracker,
+                self._on_progress,
+                self._on_result,
+                lambda: self.running,
+                min_len,
+                max_len,
+                lambda: self.paused
+            ),
             daemon=True
         )
         thread.start()
@@ -614,34 +631,55 @@ class App:
         self.running = False
         self.paused = False
         self.btn_pause.config(text="⏸  PAUSE", state="disabled")
+
         speed = int(attempts / elapsed) if elapsed > 0 else 0
         self.stat_attempts.config(text=format_int(attempts))
         self.stat_time.config(text=format_time(elapsed))
         self.stat_speed.config(text=format_int(speed))
-        self._set_progress(100 if password != "Not Found" else 0)
 
+        # ✅ HANDLE ALL CASES
         if password == "Not Found":
             self._set_status("Not Found", fg="white", bg=DANGER_DARK)
             self.lbl_result_icon.config(text="\u2717", fg=DANGER)
-            self.lbl_result_title.config(text="PASSWORD NOT FOUND",
-                                         fg=DANGER)
+            self.lbl_result_title.config(text="PASSWORD NOT FOUND", fg=DANGER)
             self.lbl_r_password.config(text=password, fg=DANGER)
+            self._set_progress(0)
+
+        elif "Stopped" in password:
+            self._set_status("Stopped", fg="#0a1929", bg=WARNING)
+            self.lbl_result_icon.config(text="\u26A0", fg=WARNING)
+            self.lbl_result_title.config(text="ATTACK STOPPED BY USER", fg=WARNING)
+            self.lbl_r_password.config(text=password, fg=WARNING)
+            self._set_progress(0)
+
         else:
             self._set_status("Cracked", fg="white", bg=SUCCESS_DARK)
             self.lbl_result_icon.config(text="\u2714", fg=SUCCESS)
-            self.lbl_result_title.config(text="PASSWORD CRACKED!",
-                                         fg=SUCCESS)
+            self.lbl_result_title.config(text="PASSWORD CRACKED!", fg=SUCCESS)
             self.lbl_r_password.config(text=password, fg=SUCCESS)
+            self._set_progress(100)
 
         self.lbl_r_attempts.config(text=format_int(attempts), fg=WARNING)
         self.lbl_r_time.config(text=format_time(elapsed), fg=SUCCESS)
-        self.lbl_r_speed.config(text=f"{format_int(speed)} attempts/second",
-                                fg=ACCENT)
+        self.lbl_r_speed.config(
+            text=f"{format_int(speed)} attempts/second",
+            fg=ACCENT
+        )
 
+        # ✅ LOGGER FIX
         params = getattr(self, "_run_params", None) or {
-            "charset_size": 0, "min_length": 0, "max_length": 0
+            "charset_size": 0,
+            "min_length": 0,
+            "max_length": 0
         }
-        status = "Cracked" if password != "Not Found" else "Not Found"
+
+        if password == "Not Found":
+            status = "Not Found"
+        elif "Stopped" in password:
+            status = "Stopped (User)"
+        else:
+            status = "Cracked"
+
         try:
             log_result(
                 password=password,
@@ -652,6 +690,7 @@ class App:
                 max_length=params["max_length"],
                 status=status,
             )
+
             current = self.lbl_status.cget("text").strip()
             self.lbl_status.config(
                 text=f"  {current} • LOGGED TO {LOG_FILE.upper()}  "
